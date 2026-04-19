@@ -17,6 +17,7 @@ OpenReel Video is a fully-featured browser-based video editor that runs entirely
 - **Professional Features** - Multi-track timeline, keyframe animations, color grading, audio effects, and more.
 - **GPU Accelerated** - WebGPU and WebCodecs for smooth 4K editing and fast exports.
 - **Free Forever** - MIT licensed, no subscriptions, no watermarks.
+- **Live Streaming** - Stream directly to Twitch (with YouTube/Kick support planned) using WebCodecs + FFmpeg
 
 ---
 
@@ -31,6 +32,15 @@ OpenReel Video is a fully-featured browser-based video editor that runs entirely
 - **Blend modes** - Multiply, screen, overlay, add, subtract, and more
 - **Speed control** - 0.25x to 4x with audio pitch preservation
 - **Crop & transform** - Position, scale, rotation with 3D perspective
+
+### Live Streaming
+- **Go Live button** - Stream directly to Twitch from the editor
+- **WebCodecs encoding** - Hardware-accelerated H.264/AAC encoding in the browser
+- **WebSocket + FFmpeg pipeline** - Efficient frame transfer to streaming server
+- **Secure credential storage** - AES-256-GCM encrypted stream keys
+- **Quality options** - 720p, 1080p, 1440p, 4K streaming
+- **Audio mixing** - Include project audio and/or microphone
+- **Live stats** - Duration, frame count, bitrate display
 
 ### Graphics & Text
 - **Professional text editor** - Rich styling, shadows, outlines, gradients
@@ -104,11 +114,28 @@ cd openreel
 # Install dependencies (requires Node.js 18+)
 pnpm install
 
-# Start development server
+# Start development server (includes streaming server on port 8081)
+./start.sh
+
+# Or manually:
+# Terminal 1: Streaming server
+cd apps/streaming-server && pnpm dev
+
+# Terminal 2: Web dev server
 pnpm dev
 
 # Open http://localhost:5173
 ```
+
+### Stream to Twitch
+
+1. Open **Settings > Streaming** tab
+2. Set a **master password** for secure storage
+3. Enter your **Twitch RTMP ingest URL** (e.g., `rtmp://live.twitch.tv/app`)
+4. Add your **Twitch stream key** (found in Twitch Dashboard → Settings → Stream)
+5. Verify **Server URL** is `ws://localhost:8081`
+6. Click **Test Server** to verify connection
+7. Click **Go Live** in the toolbar to start streaming
 
 ### Build for Production
 
@@ -116,6 +143,53 @@ pnpm dev
 pnpm build
 pnpm preview
 ```
+
+---
+
+## Streaming Architecture
+
+OpenReel uses a client-side WebCodecs + WebSocket + FFmpeg pipeline for live streaming:
+
+```
+┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│   Web Browser   │     │  Streaming       │     │     Twitch      │
+│                 │     │  Server           │     │                 │
+│  ┌───────────┐  │     │  ┌────────────┐  │     │                 │
+│  │ Canvas    │──┼────▶│▶│ WebSocket  │  │     │                 │
+│  │ (capture) │  │     │  │  Server    │  │     │                 │
+│  └───────────┘  │     │  └─────┬──────┘  │     │                 │
+│                 │     │        │         │     │                 │
+│  ┌───────────┐  │     │  ┌─────▼──────┐  │     │                 │
+│  │ WebCodecs │──┼────▶│▶│ FFmpeg     │──┼────▶│ RTMP Ingest     │
+│  │ (H.264)   │  │     │  │ (passthrough)│ │     │                 │
+│  └───────────┘  │     │  └────────────┘  │     │                 │
+│                 │     │                  │     │                 │
+│  ┌───────────┐  │     │                  │     │                 │
+│  │ WebCodecs │──┼────▶│                  │     │                 │
+│  │ (AAC)     │  │     │                  │     │                 │
+│  └───────────┘  │     │                  │     │                 │
+└─────────────────┘     └──────────────────┘     └─────────────────┘
+```
+
+### Components
+
+1. **StreamingService** (`apps/web/src/services/streaming-service.ts`)
+   - Uses `MediaStreamTrackProcessor` to capture canvas frames
+   - `VideoEncoder` for H.264 encoding (avc1.42E01E)
+   - `AudioEncoder` for AAC encoding
+   - WebSocket binary frame transfer (type byte: 0=video, 1=audio)
+   - SimpleEmitter for event handling (not Node events)
+
+2. **Streaming Server** (`apps/streaming-server/`)
+   - WebSocket server on port 8081
+   - Named pipes (FIFOs) for FFmpeg input
+   - FFmpeg passthrough: H.264 → RTMP without re-encoding
+   - Audio mixing: AAC passthrough
+
+3. **Secure Storage**
+   - Stream keys encrypted with AES-256-GCM
+   - Master password required for access
+   - Uses existing `secure-storage` pattern
 
 ---
 
@@ -143,22 +217,28 @@ All major browsers now support WebCodecs for hardware-accelerated video encoding
 
 ```
 openreel/
-├── apps/web/              # React frontend (~66k lines)
-│   └── src/
-│       ├── components/    # UI components
-│       │   └── editor/    # Editor panels (Timeline, Preview, Inspector)
-│       ├── stores/        # Zustand state management
-│       ├── services/      # Auto-save, shortcuts, screen recording
-│       └── bridges/       # Engine coordination
+├── apps/
+│   ├── web/                  # React frontend (~66k lines)
+│   │   └── src/
+│   │       ├── components/   # UI components
+│   │       │   └── editor/  # Editor panels (Timeline, Preview, Inspector)
+│   │       ├── stores/       # Zustand state management
+│   │       ├── services/     # Auto-save, shortcuts, streaming
+│   │       └── bridges/      # Engine coordination
+│   │
+│   └── streaming-server/     # Node.js WebSocket + FFmpeg server
+│       └── src/
+│           └── index.ts      # Streaming pipeline
 │
-└── packages/core/         # Core engines (~59k lines)
-    └── src/
-        ├── video/         # Video processing, WebGPU rendering
-        ├── audio/         # Web Audio API, effects, beat detection
-        ├── graphics/      # Canvas/THREE.js, shapes, SVG
-        ├── text/          # Text rendering, animations
-        ├── export/        # MP4/WebM encoding
-        └── storage/       # IndexedDB, serialization
+├── packages/
+│   └── core/                 # Core engines (~59k lines)
+│       └── src/
+│           ├── video/        # Video processing, WebGPU rendering
+│           ├── audio/        # Web Audio API, effects, beat detection
+│           ├── graphics/     # Canvas/THREE.js, shapes, SVG
+│           ├── text/        # Text rendering, animations
+│           ├── export/       # MP4/WebM encoding
+│           └── storage/      # IndexedDB, serialization
 ```
 
 ### Key Technologies
@@ -171,6 +251,8 @@ openreel/
 - **Web Audio API** - Professional audio processing
 - **THREE.js** - 3D transforms and effects
 - **IndexedDB** - Local project storage
+- **ws** - WebSocket server (streaming)
+- **FFmpeg** - RTMP output
 
 ### Design Principles
 
@@ -178,6 +260,7 @@ openreel/
 - **Immutable state** - Predictable updates with Zustand
 - **Engine separation** - Video, audio, graphics engines are independent
 - **Progressive enhancement** - Graceful fallbacks (WebGPU → Canvas2D)
+- **Client-side privacy** - No data leaves the browser
 
 ---
 
@@ -249,6 +332,7 @@ git push origin feat/your-feature
 - Screen recording
 - AI upscaling
 - Undo/redo with auto-save
+- **Live streaming to Twitch**
 
 ### In Progress
 - Nested sequences (timeline in timeline)
@@ -299,4 +383,4 @@ See [LICENSE](LICENSE) for details.
 
 **Built with care by [@python_xi](https://x.com/python_xi) and AI working together.**
 
-*Making professional video editing accessible to everyone. Forever free. Forever open source.*
+*Making professional video editing accessible to everyone. Forever free. forever open source.*
