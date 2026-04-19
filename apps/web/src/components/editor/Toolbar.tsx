@@ -1,4 +1,4 @@
-import React, { useCallback, useState, useEffect } from "react";
+import React, { useCallback, useState, useEffect, useMemo } from "react";
 import {
   Search,
   Command,
@@ -21,6 +21,7 @@ import {
   Diamond,
   Sparkles,
   Play,
+  Radio,
 } from "lucide-react";
 import { useProjectStore } from "../../stores/project-store";
 import { useUIStore } from "../../stores/ui-store";
@@ -41,6 +42,7 @@ import { ScreenRecorder } from "./ScreenRecorder";
 import { HistoryPanel } from "./inspector/HistoryPanel";
 import { ProjectSwitcher } from "./ProjectSwitcher";
 import { SettingsDialog } from "./settings/SettingsDialog";
+import { StreamingDialog } from "./StreamingDialog";
 import { toast } from "../../stores/notification-store";
 import { useSettingsStore } from "../../stores/settings-store";
 import { useAnalytics, AnalyticsEvents } from "../../hooks/useAnalytics";
@@ -90,15 +92,25 @@ export const Toolbar: React.FC = () => {
   } = useUIStore();
   const { mode: themeMode, toggleTheme } = useThemeStore();
   const { navigate } = useRouter();
-  const { openSettings } = useSettingsStore();
-  const [isExportOpen, setIsExportOpen] = useState(false);
-  const [isExportDialogOpen, setIsExportDialogOpen] = useState(false);
-  const [isRecorderOpen, setIsRecorderOpen] = useState(false);
-  const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+   const { openSettings, configuredServices, streamingSettings } = useSettingsStore();
+   const [isExportOpen, setIsExportOpen] = useState(false);
+   const [isExportDialogOpen, setIsExportDialogOpen] = useState(false);
+   const [isRecorderOpen, setIsRecorderOpen] = useState(false);
+   const [isStreamingOpen, setIsStreamingOpen] = useState(false);
+   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const { importMedia } = useProjectStore();
-  const { track } = useAnalytics();
+   const { track } = useAnalytics();
 
-  const handleStartTour = useCallback(() => {
+   // Compute if streaming is configured (Twitch key set and URLs present)
+   const isStreamingConfigured = useMemo(() => {
+     return (
+       configuredServices.includes("twitch") &&
+       !!streamingSettings.twitch.ingestUrl &&
+       !!streamingSettings.twitch.serverUrl
+     );
+   }, [configuredServices, streamingSettings.twitch.ingestUrl, streamingSettings.twitch.serverUrl]);
+
+   const handleStartTour = useCallback(() => {
     localStorage.removeItem(ONBOARDING_KEY);
     startTour();
   }, []);
@@ -868,6 +880,26 @@ export const Toolbar: React.FC = () => {
           </TooltipContent>
         </Tooltip>
 
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              onClick={() => setIsStreamingOpen(true)}
+              disabled={!isStreamingConfigured}
+              className={`flex items-center gap-2 px-3 py-2 rounded-lg transition-colors ${
+                isStreamingConfigured
+                  ? "bg-purple/10 hover:bg-purple/20 text-purple"
+                  : "bg-muted text-muted-foreground cursor-not-allowed"
+              }`}
+            >
+              <Radio size={14} className="fill-current" />
+              <span className="text-sm font-medium">Go Live</span>
+            </button>
+          </TooltipTrigger>
+          <TooltipContent>
+            <p>{isStreamingConfigured ? "Start Twitch Stream" : "Configure Twitch in Settings first"}</p>
+          </TooltipContent>
+        </Tooltip>
+
         <div className="relative">
           {exportState.isExporting ? (
             <div className="h-10 px-4 bg-background-secondary border border-border rounded-lg flex items-center gap-3 min-w-[200px]">
@@ -1021,6 +1053,11 @@ export const Toolbar: React.FC = () => {
         isOpen={isRecorderOpen}
         onClose={() => setIsRecorderOpen(false)}
         onRecordingComplete={handleRecordingComplete}
+      />
+
+      <StreamingDialog
+        isOpen={isStreamingOpen}
+        onClose={() => setIsStreamingOpen(false)}
       />
 
       <SettingsDialog />

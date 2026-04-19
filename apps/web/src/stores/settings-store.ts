@@ -10,6 +10,24 @@ export interface ServiceConfig {
 }
 
 /**
+ * Streaming service configuration (non-secret).
+ * Secrets (stream keys) stored separately in secure storage.
+ */
+export interface StreamingServiceSettings {
+  twitch: {
+    channelName: string;
+    ingestUrl: string;
+    streamKeyId: string;
+    serverUrl: string;
+    preferredQuality: StreamQuality;
+    includeAudio: boolean;
+    micEnabled: boolean;
+  };
+}
+
+export type StreamQuality = "720p" | "1080p" | "1440p" | "4K";
+
+/**
  * Registry of supported external services that require API keys.
  * Add new services here as the app integrates more third-party APIs.
  */
@@ -44,12 +62,18 @@ export const SERVICE_REGISTRY: readonly ServiceConfig[] = [
     description: "AI aggregator for image generation, vectors, and creative assets",
     docsUrl: "https://www.freepik.com/api",
   },
+  {
+    id: "twitch",
+    label: "Twitch",
+    description: "Live streaming platform",
+    docsUrl: "https://dev.twitch.tv/docs/video-broadcast/",
+  },
 ] as const;
 
 export type TtsProvider = "piper" | "elevenlabs";
 export type LlmProvider = "openai" | "anthropic";
 export type AggregatorProvider = "kie-ai" | "freepik";
-export type SettingsTab = "general" | "api-keys";
+export type SettingsTab = "general" | "api-keys" | "streaming";
 
 export interface SettingsState {
   // General preferences
@@ -65,6 +89,19 @@ export interface SettingsState {
   favoriteVoices: Array<{ voiceId: string; name: string; previewUrl?: string }>;
   favoriteModels: Array<{ modelId: string; name: string }>;
   configuredServices: string[]; // IDs of services with stored API keys
+
+  // Streaming configuration (non-secret)
+  streamingSettings: {
+    twitch: {
+      channelName: string;
+      ingestUrl: string;
+      streamKeyId: string;
+      serverUrl: string;
+      preferredQuality: StreamQuality;
+      includeAudio: boolean;
+      micEnabled: boolean;
+    };
+  };
 
   // Session-scoped API caches (cleared on session lock, not persisted)
   cachedElevenLabsVoices: Array<{ voice_id: string; name: string; category: string; labels: Record<string, string>; preview_url?: string }> | null;
@@ -93,6 +130,7 @@ export interface SettingsState {
   clearApiCaches: () => void;
   openSettings: (tab?: SettingsTab) => void;
   closeSettings: () => void;
+  updateStreamingSettings: (updates: Partial<SettingsState["streamingSettings"]["twitch"]>) => void;
 }
 
 export const useSettingsStore = create<SettingsState>()(
@@ -110,6 +148,18 @@ export const useSettingsStore = create<SettingsState>()(
         favoriteVoices: [],
         favoriteModels: [],
         configuredServices: [],
+
+        streamingSettings: {
+          twitch: {
+            channelName: "",
+            ingestUrl: "",
+            streamKeyId: "twitch-stream-key",
+            preferredQuality: "1080p" as StreamQuality,
+            includeAudio: true,
+            micEnabled: false,
+            serverUrl: "ws://localhost:8081",
+          },
+        },
 
         cachedElevenLabsVoices: null,
         cachedElevenLabsModels: null,
@@ -190,6 +240,17 @@ export const useSettingsStore = create<SettingsState>()(
           }),
 
         closeSettings: () => set({ settingsOpen: false }),
+
+        updateStreamingSettings: (updates) =>
+          set((state) => ({
+            streamingSettings: {
+              ...state.streamingSettings,
+              twitch: {
+                ...state.streamingSettings.twitch,
+                ...updates,
+              },
+            },
+          })),
       }),
       {
         name: "openreel-settings",
@@ -205,6 +266,7 @@ export const useSettingsStore = create<SettingsState>()(
           favoriteVoices: state.favoriteVoices,
           favoriteModels: state.favoriteModels,
           configuredServices: state.configuredServices,
+          streamingSettings: state.streamingSettings,
         }),
       },
     ),

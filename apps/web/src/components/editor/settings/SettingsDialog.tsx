@@ -1,5 +1,5 @@
 import React, { useCallback } from "react";
-import { Settings, Key } from "lucide-react";
+import { Settings, Key, Radio } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -10,10 +10,12 @@ import {
 import { useSettingsStore, type SettingsTab } from "../../../stores/settings-store";
 import { GeneralPanel } from "./GeneralPanel";
 import { ApiKeysPanel } from "./ApiKeysPanel";
+import { StreamingPanel } from "./StreamingPanel";
 
 const TABS: readonly { id: SettingsTab; label: string; icon: typeof Settings }[] = [
   { id: "general", label: "General", icon: Settings },
   { id: "api-keys", label: "API Keys", icon: Key },
+  { id: "streaming", label: "Streaming", icon: Radio },
 ];
 
 export const SettingsDialog: React.FC = () => {
@@ -65,6 +67,7 @@ export const SettingsDialog: React.FC = () => {
         >
           {settingsTab === "general" && <GeneralPanel />}
           {settingsTab === "api-keys" && <ApiKeysPanel />}
+          {settingsTab === "streaming" && <StreamingPanel />}
         </div>
       </DialogContent>
     </Dialog>
