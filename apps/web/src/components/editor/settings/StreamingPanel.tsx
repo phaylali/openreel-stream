@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   Radio,
   Link,
@@ -12,6 +12,13 @@ import {
   EyeOff,
   Trash2,
   Settings,
+  Play,
+  Square,
+  RefreshCw,
+  Activity,
+  Tv,
+  CheckCircle,
+  XCircle,
 } from "lucide-react";
 import { Input, Button, Select, SelectItem, SelectTrigger, SelectValue, SelectContent } from "@openreel/ui";
 import { useSettingsStore } from "../../../stores/settings-store";
@@ -54,6 +61,11 @@ export const StreamingPanel: React.FC = () => {
   const [testingServer, setTestingServer] = useState(false);
   const [, setTwitchConfigured] = useState(false);
   const [newStreamKey, setNewStreamKey] = useState("");
+  const [channelLive, setChannelLive] = useState<boolean | null>(null);
+  const [checkingLive, setCheckingLive] = useState(false);
+  const [testStreaming, setTestStreaming] = useState(false);
+  const [testStreamWs, setTestStreamWs] = useState<WebSocket | null>(null);
+  const liveCheckInterval = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const refreshState = useCallback(async () => {
     const isSet = await isMasterPasswordSet();
@@ -215,6 +227,151 @@ export const StreamingPanel: React.FC = () => {
     }
   }, []);
 
+  const checkChannelLive = useCallback(async () => {
+    const channelName = streamingSettings.twitch.channelName.trim();
+    if (!channelName) {
+      toast.error("Channel name missing", "Enter your Twitch channel name in settings.");
+      return;
+    }
+    setCheckingLive(true);
+    try {
+      const res = await fetch(`https://twitch.tv/${encodeURIComponent(channelName)}`);
+      const html = await res.text();
+      const isLive = html.includes('"isLiveBroadcast":true') || html.includes('"isLiveBroadcast": true');
+      setChannelLive(isLive);
+      if (isLive) {
+        toast.success("Channel is LIVE!", `${channelName} is currently streaming on Twitch.`);
+      } else {
+        toast.info("Channel is offline", `${channelName} is not currently streaming.`);
+      }
+    } catch (err) {
+      console.error("Live check error:", err);
+      setChannelLive(null);
+      toast.error("Live check failed", err instanceof Error ? err.message : "Unknown error");
+    } finally {
+      setCheckingLive(false);
+    }
+  }, [streamingSettings.twitch.channelName]);
+
+  useEffect(() => {
+    if (unlocked && streamingSettings.twitch.channelName.trim()) {
+      checkChannelLive();
+      liveCheckInterval.current = setInterval(checkChannelLive, 30000);
+      return () => {
+        if (liveCheckInterval.current) clearInterval(liveCheckInterval.current);
+      };
+    }
+  }, [unlocked, streamingSettings.twitch.channelName, checkChannelLive]);
+
+  const startTestStream = useCallback(async () => {
+    const serverUrl = streamingSettings.twitch.serverUrl;
+    const key = await getSecret("twitch-stream-key");
+    const ingestUrl = streamingSettings.twitch.ingestUrl;
+
+    if (!serverUrl || !key || !ingestUrl) {
+      toast.error("Missing config", "Set server URL, ingest URL, and stream key first.");
+      return;
+    }
+
+    setTestStreaming(true);
+    try {
+      const ws = new WebSocket(serverUrl);
+      ws.binaryType = "arraybuffer";
+
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error("Connection timeout")), 5000);
+        ws.onopen = () => { clearTimeout(timeout); resolve(); };
+        ws.onerror = () => { clearTimeout(timeout); reject(new Error("Connection failed")); };
+      });
+
+      ws.send(JSON.stringify({
+        type: "start",
+        data: {
+          ingestUrl,
+          streamKey: `${key}?bandwidthtest=true`,
+          quality: "720p",
+          bitrate: 4000000,
+          width: 1280,
+          height: 720,
+          fps: 30,
+          hasAudio: false,
+          amdDriver: streamingSettings.twitch.amdDriver || "auto",
+          isTestStream: true,
+        },
+      }));
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data as string);
+          if (msg.type === "started") {
+            toast.success("Test stream started", "Sending test video to Twitch...");
+          } else if (msg.type === "error") {
+            toast.error("Test stream error", msg.data as string);
+          } else if (msg.type === "stopped") {
+            toast.info("Test stream stopped", "Test stream has ended.");
+            setTestStreaming(false);
+          }
+        } catch {}
+      };
+
+      ws.onclose = () => {
+        setTestStreaming(false);
+      };
+
+      setTestStreamWs(ws);
+
+      const canvas = document.createElement("canvas");
+      canvas.width = 1280;
+      canvas.height = 720;
+      const ctx = canvas.getContext("2d")!;
+      const stream = canvas.captureStream(30);
+
+      const recorder = new MediaRecorder(stream, { mimeType: "video/webm", videoBitsPerSecond: 4000000 });
+      let frame = 0;
+
+      const drawLoop = () => {
+        if (!testStreamWs || testStreamWs.readyState !== WebSocket.OPEN) return;
+        frame++;
+        ctx.fillStyle = `hsl(${(frame * 2) % 360}, 70%, 20%)`;
+        ctx.fillRect(0, 0, 1280, 720);
+        ctx.fillStyle = "#fff";
+        ctx.font = "bold 48px monospace";
+        ctx.textAlign = "center";
+        ctx.fillText("TEST STREAM", 640, 300);
+        ctx.font = "24px monospace";
+        ctx.fillText(`Frame: ${frame}`, 640, 360);
+        ctx.fillText(`Time: ${new Date().toLocaleTimeString()}`, 640, 400);
+        ctx.font = "18px monospace";
+        ctx.fillText("OpenReel Streaming Test", 640, 460);
+        requestAnimationFrame(drawLoop);
+      };
+      drawLoop();
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+          event.data.arrayBuffer().then(buf => ws.send(buf));
+        }
+      };
+
+      recorder.start(500);
+      toast.success("Test stream running", "Color bars + frame counter streaming to Twitch");
+
+    } catch (err) {
+      toast.error("Test stream failed", err instanceof Error ? err.message : "Unknown error");
+      setTestStreaming(false);
+    }
+  }, [streamingSettings.twitch, testStreamWs]);
+
+  const stopTestStream = useCallback(() => {
+    if (testStreamWs && testStreamWs.readyState === WebSocket.OPEN) {
+      testStreamWs.send(JSON.stringify({ type: "stop" }));
+      testStreamWs.close();
+    }
+    setTestStreamWs(null);
+    setTestStreaming(false);
+    toast.info("Test stream stopped");
+  }, [testStreamWs]);
+
   // Not set up yet
   if (!passwordSet) {
     return (
@@ -315,6 +472,46 @@ export const StreamingPanel: React.FC = () => {
           />
         </div>
 
+        {/* Twitch Client-ID (kept for reference, not needed for HTML scraping) */}
+        <div className="grid grid-cols-2 gap-4 items-start">
+          <label htmlFor="twitch-client-id" className="text-sm text-text-secondary text-right pt-2">
+            Twitch Client-ID
+          </label>
+          <div className="space-y-2">
+            <Input
+              id="twitch-client-id"
+              type="text"
+              value={streamingSettings.twitch.twitchClientId}
+              onChange={(e) => updateStreamingSettings({ twitchClientId: e.target.value })}
+              placeholder="Optional (not needed for live check)"
+              className="max-w-xs font-mono text-xs"
+            />
+            <p className="text-xs text-text-muted">
+              Live status uses HTML scraping (no API key needed). Client-ID stored for future use.
+            </p>
+          </div>
+        </div>
+
+        {/* Twitch Client Secret (hidden, kept for future API use) */}
+        <div className="grid grid-cols-2 gap-4 items-start">
+          <label htmlFor="twitch-client-secret" className="text-sm text-text-secondary text-right pt-2">
+            Twitch Client Secret
+          </label>
+          <div className="space-y-2">
+            <Input
+              id="twitch-client-secret"
+              type="password"
+              value={streamingSettings.twitch.twitchClientSecret}
+              onChange={(e) => updateStreamingSettings({ twitchClientSecret: e.target.value })}
+              placeholder="Optional (not needed for live check)"
+              className="max-w-xs font-mono text-xs"
+            />
+            <p className="text-xs text-text-muted">
+              Optional. Stored for future API features.
+            </p>
+          </div>
+        </div>
+
         {/* Ingest Server (RTMP) */}
         <div className="grid grid-cols-2 gap-4 items-start">
           <label htmlFor="ingest-url" className="text-sm text-text-secondary text-right pt-2">
@@ -403,6 +600,81 @@ export const StreamingPanel: React.FC = () => {
             {testingTwitch ? "Testing..." : "Test Connection"}
           </Button>
         </div>
+
+        {/* Channel Live Status */}
+        <div className="grid grid-cols-2 gap-4 items-center">
+          <div className="text-sm text-text-secondary text-right flex items-center justify-end gap-2">
+            <Tv size={14} />
+            Channel Status
+          </div>
+          <div className="flex items-center gap-3">
+            <div className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium ${
+              channelLive === true
+                ? "bg-green-500/10 text-green-400 border border-green-500/20"
+                : channelLive === false
+                  ? "bg-gray-500/10 text-gray-400 border border-gray-500/20"
+                  : "bg-yellow-500/10 text-yellow-400 border border-yellow-500/20"
+            }`}>
+              {checkingLive ? (
+                <Loader2 size={14} className="animate-spin" />
+              ) : channelLive === true ? (
+                <CheckCircle size={14} />
+              ) : channelLive === false ? (
+                <XCircle size={14} />
+              ) : (
+                <AlertCircle size={14} />
+              )}
+              {checkingLive
+                ? "Checking..."
+                : channelLive === true
+                  ? "LIVE"
+                  : channelLive === false
+                    ? "Offline"
+                    : "Unknown"}
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={checkChannelLive}
+              disabled={checkingLive}
+            >
+              <RefreshCw size={14} className={`mr-1 ${checkingLive ? "animate-spin" : ""}`} />
+              Refresh
+            </Button>
+            <span className="text-xs text-text-muted">Auto-refreshes every 30s</span>
+          </div>
+        </div>
+
+        {/* Test Stream */}
+        <div className="grid grid-cols-2 gap-4 items-center">
+          <div className="text-sm text-text-secondary text-right flex items-center justify-end gap-2">
+            <Activity size={14} />
+            Test Stream
+          </div>
+          <div className="flex items-center gap-2">
+            {testStreaming ? (
+              <Button
+                variant="destructive"
+                size="sm"
+                onClick={stopTestStream}
+              >
+                <Square size={14} className="mr-1" />
+                Stop Test Stream
+              </Button>
+            ) : (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={startTestStream}
+                disabled={testStreaming}
+              >
+                <Play size={14} className="mr-1" />
+                Start Test Stream
+              </Button>
+            )}
+            <span className="text-xs text-text-muted">Sends color bars to Twitch</span>
+          </div>
+        </div>
       </div>
 
       {/* Stream Defaults Section */}
@@ -460,6 +732,33 @@ export const StreamingPanel: React.FC = () => {
             />
             <span className="text-sm">Add mic input to stream</span>
           </label>
+        </div>
+
+        {/* AMD Driver Selection */}
+        <div className="grid grid-cols-2 gap-4 items-center">
+          <label htmlFor="amd-driver" className="text-sm text-text-secondary text-right">
+            AMD GPU Driver
+          </label>
+          <div className="space-y-2">
+            <Select
+              value={streamingSettings.twitch.amdDriver}
+              onValueChange={(v: "mesa" | "vulkan" | "auto") => updateStreamingSettings({ amdDriver: v })}
+            >
+              <SelectTrigger id="amd-driver" className="w-[180px]">
+                <SelectValue placeholder="Select driver" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="mesa">Mesa (Open Source)</SelectItem>
+                <SelectItem value="vulkan">AMDVLK (Vulkan)</SelectItem>
+                <SelectItem value="auto">Auto-detect</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-text-muted">
+              Mesa: Full hardware encoding support, recommended
+              <br />
+              AMDVLK: Alternative Vulkan driver
+            </p>
+          </div>
         </div>
       </div>
 

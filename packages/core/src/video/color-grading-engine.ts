@@ -295,21 +295,23 @@ export class ColorGradingEngine {
     this.height = height;
   }
 
-  initialize(): void {
-    if (this.initialized) return;
+  initialize(): boolean {
+    if (this.initialized) return true;
 
-    this.canvas = new OffscreenCanvas(this.width, this.height);
-    const gl = this.canvas.getContext("webgl2", {
-      preserveDrawingBuffer: true,
-      premultipliedAlpha: true,
-      alpha: true,
-    });
+    try {
+      this.canvas = new OffscreenCanvas(this.width, this.height);
+      const gl = this.canvas.getContext("webgl2", {
+        preserveDrawingBuffer: true,
+        premultipliedAlpha: true,
+        alpha: true,
+      });
 
-    if (!gl) {
-      throw new Error("WebGL2 not supported");
-    }
+      if (!gl) {
+        console.warn("[ColorGradingEngine] WebGL2 not supported, effects will be disabled");
+        return false;
+      }
 
-    this.gl = gl;
+      this.gl = gl;
     this.quadBuffer = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
     gl.bufferData(
@@ -332,6 +334,13 @@ export class ColorGradingEngine {
     this.compileShader("lut", VERTEX_SHADER, LUT_SHADER);
 
     this.initialized = true;
+      return true;
+    } catch (error) {
+      console.warn("[ColorGradingEngine] Initialization failed:", error);
+      this.gl = null;
+      this.canvas = null;
+      return false;
+    }
   }
 
   private compileShader(

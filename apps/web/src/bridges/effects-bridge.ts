@@ -136,18 +136,31 @@ export class EffectsBridge {
     }
 
     try {
-      this.videoEffectsEngine = new VideoEffectsEngine({
-        width,
-        height,
-        useGPU: true,
-        preferWebGPU: isWebGPUSupported(),
-      });
-      await this.videoEffectsEngine.initialize();
+      // Try to initialize video effects engine (may fail if WebGL2/WebGPU unavailable)
+      try {
+        this.videoEffectsEngine = new VideoEffectsEngine({
+          width,
+          height,
+          useGPU: true,
+          preferWebGPU: isWebGPUSupported(),
+        });
+        await this.videoEffectsEngine.initialize();
+      } catch (error) {
+        console.warn("[EffectsBridge] VideoEffectsEngine initialization failed, effects will be disabled:", error);
+        this.videoEffectsEngine = null;
+      }
 
+      // Try to initialize color grading engine
       this.colorGradingEngine = new ColorGradingEngine(width, height);
-      this.colorGradingEngine.initialize();
+      const colorGradingInitialized = this.colorGradingEngine.initialize();
+      if (!colorGradingInitialized) {
+        console.warn("[EffectsBridge] ColorGradingEngine initialization failed, color grading will be disabled");
+        this.colorGradingEngine = null;
+      }
 
+      // Mark as initialized even if some features failed - app can still function
       this.initialized = true;
+      console.log("[EffectsBridge] Initialized (some features may be disabled if GPU unavailable)");
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : "Unknown initialization error";

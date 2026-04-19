@@ -61,6 +61,7 @@ export const StreamingDialog: React.FC<StreamingDialogProps> = ({ isOpen, onClos
         twitchStreamKey: streamKey,
         ingestUrl,
         serverUrl,
+        amdDriver: streamingSettings.twitch.amdDriver,
       };
       await streamingStore.startStream(cfg);
     } catch (err) {
@@ -182,13 +183,13 @@ export const StreamingDialog: React.FC<StreamingDialogProps> = ({ isOpen, onClos
     );
   }
 
-  // Live
+  // Live - Non-blocking floating panel (allows editing while streaming)
   if (status === "live" || status === "paused") {
     return (
-      <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-50">
-        <div className="bg-background-secondary border-2 border-purple rounded-xl p-6 max-w-sm w-full mx-4 shadow-2xl">
+      <div className="fixed bottom-4 right-4 z-50">
+        <div className="bg-background-secondary border-2 border-purple rounded-xl p-4 w-72 shadow-2xl">
           {/* Header */}
-          <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-2">
               <div className={`w-3 h-3 rounded-full ${status === "live" ? "bg-red-500 animate-pulse" : "bg-amber-500"} `} />
               <span className="text-lg font-bold text-text-primary">
@@ -198,33 +199,30 @@ export const StreamingDialog: React.FC<StreamingDialogProps> = ({ isOpen, onClos
             <button
               onClick={onClose}
               className="p-1 rounded hover:bg-background-tertiary text-text-muted hover:text-text-primary"
+              title="Minimize (stream continues)"
             >
               <X size={16} />
             </button>
           </div>
 
           {/* Stats */}
-          <div className="grid grid-cols-2 gap-3 mb-6">
-            <div className="bg-background-tertiary rounded-lg p-3 text-center">
-              <div className="text-2xl font-mono text-text-primary">{formattedDuration}</div>
+          <div className="grid grid-cols-2 gap-2 mb-3">
+            <div className="bg-background-tertiary rounded-lg p-2 text-center">
+              <div className="text-lg font-mono text-text-primary">{formattedDuration}</div>
               <div className="text-xs text-text-muted uppercase">Duration</div>
             </div>
-            <div className="bg-background-tertiary rounded-lg p-3 text-center">
-              <div className="text-2xl font-mono text-text-primary">{formattedBitrate}</div>
+            <div className="bg-background-tertiary rounded-lg p-2 text-center">
+              <div className="text-lg font-mono text-text-primary">{formattedBitrate}</div>
               <div className="text-xs text-text-muted uppercase">Bitrate</div>
             </div>
           </div>
 
           {/* Additional stats */}
           {stats && (
-            <div className="text-xs text-text-muted mb-4 space-y-1">
+            <div className="text-xs text-text-muted mb-3 space-y-0.5">
               <div className="flex justify-between">
-                <span>Frames encoded:</span>
-                <span>{stats.framesEncoded}</span>
-              </div>
-              <div className="flex justify-between">
-                <span>Frames sent:</span>
-                <span>{stats.framesSent}</span>
+                <span>Frames:</span>
+                <span>{stats.framesEncoded} / {stats.framesSent}</span>
               </div>
               <div className="flex justify-between">
                 <span>Dropped:</span>
@@ -237,27 +235,31 @@ export const StreamingDialog: React.FC<StreamingDialogProps> = ({ isOpen, onClos
           <div className="flex gap-2">
             {status === "live" ? (
               <>
-                <Button variant="outline" className="flex-1" onClick={handlePause}>
-                  <Pause size={16} className="mr-2" />
+                <Button variant="outline" size="sm" className="flex-1" onClick={handlePause}>
+                  <Pause size={14} className="mr-1" />
                   Pause
                 </Button>
-                <Button variant="destructive" className="flex-1" onClick={handleStop}>
-                  <Square size={16} className="mr-2 fill-current" />
-                  End Stream
+                <Button variant="destructive" size="sm" className="flex-1" onClick={handleStop}>
+                  <Square size={14} className="mr-1 fill-current" />
+                  Stop
                 </Button>
               </>
             ) : (
               <>
-                <Button variant="default" className="flex-1" onClick={handleResume}>
-                  <Play size={16} className="mr-2" />
+                <Button variant="default" size="sm" className="flex-1" onClick={handleResume}>
+                  <Play size={14} className="mr-1" />
                   Resume
                 </Button>
-                <Button variant="destructive" className="flex-1" onClick={handleStop}>
-                  <Square size={16} className="mr-2 fill-current" />
-                  End Stream
+                <Button variant="destructive" size="sm" className="flex-1" onClick={handleStop}>
+                  <Square size={14} className="mr-1 fill-current" />
+                  Stop
                 </Button>
               </>
             )}
+          </div>
+          
+          <div className="mt-2 text-xs text-text-muted text-center">
+            You can edit sources while streaming
           </div>
         </div>
       </div>

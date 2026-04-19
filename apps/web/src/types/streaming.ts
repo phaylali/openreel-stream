@@ -10,11 +10,12 @@ export interface AudioConfig {
 }
 
 export interface StreamConfig {
-  quality: StreamQuality;
+  quality: string;  // Allow custom quality strings like "1080p60"
   audio: AudioConfig;
   twitchStreamKey: string;
   ingestUrl: string;
   serverUrl: string;
+  amdDriver?: "mesa" | "vulkan" | "auto";
 }
 
 export interface StreamStats {

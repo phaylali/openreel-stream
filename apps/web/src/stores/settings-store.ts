@@ -22,10 +22,15 @@ export interface StreamingServiceSettings {
     preferredQuality: StreamQuality;
     includeAudio: boolean;
     micEnabled: boolean;
+    amdDriver: AMDDriver;
+    twitchClientId: string;
+    twitchClientSecret: string;
   };
 }
 
 export type StreamQuality = "720p" | "1080p" | "1440p" | "4K";
+
+export type AMDDriver = "mesa" | "vulkan" | "auto";
 
 /**
  * Registry of supported external services that require API keys.
@@ -100,6 +105,9 @@ export interface SettingsState {
       preferredQuality: StreamQuality;
       includeAudio: boolean;
       micEnabled: boolean;
+      amdDriver: AMDDriver;
+      twitchClientId: string;
+      twitchClientSecret: string;
     };
   };
 
@@ -158,6 +166,9 @@ export const useSettingsStore = create<SettingsState>()(
             includeAudio: true,
             micEnabled: false,
             serverUrl: "ws://localhost:8081",
+            amdDriver: "mesa" as AMDDriver,
+            twitchClientId: "",
+            twitchClientSecret: "",
           },
         },
 
