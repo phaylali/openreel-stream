@@ -235,9 +235,11 @@ export const StreamingPanel: React.FC = () => {
     }
     setCheckingLive(true);
     try {
-      const res = await fetch(`https://twitch.tv/${encodeURIComponent(channelName)}`);
-      const html = await res.text();
-      const isLive = html.includes('"isLiveBroadcast":true') || html.includes('"isLiveBroadcast": true');
+      const serverUrl = streamingSettings.twitch.serverUrl.replace("ws://", "http://").replace("wss://", "https://").replace(/\/+$/, "");
+      const res = await fetch(`${serverUrl.replace(/:\d+$/, "")}:${8082}/api/twitch/live?channel=${encodeURIComponent(channelName)}`);
+      if (!res.ok) throw new Error(`API error: ${res.status}`);
+      const data = await res.json();
+      const isLive = data.isLive;
       setChannelLive(isLive);
       if (isLive) {
         toast.success("Channel is LIVE!", `${channelName} is currently streaming on Twitch.`);
@@ -251,7 +253,7 @@ export const StreamingPanel: React.FC = () => {
     } finally {
       setCheckingLive(false);
     }
-  }, [streamingSettings.twitch.channelName]);
+  }, [streamingSettings.twitch.channelName, streamingSettings.twitch.serverUrl]);
 
   useEffect(() => {
     if (unlocked && streamingSettings.twitch.channelName.trim()) {

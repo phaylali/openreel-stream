@@ -67,6 +67,10 @@ interface WebSocketMessage {
 
 export class StreamingService extends SimpleEmitter {
   private websocket: WebSocket | null = null;
+  private mediaRecorder: MediaRecorder | null = null;
+  private canvasStream: MediaStream | null = null;
+  private audioStream: MediaStream | null = null;
+  private combinedStream: MediaStream | null = null;
   private config: StreamConfig | null = null;
   private status: StreamStatus = "idle";
   private stats: StreamStats = {
@@ -85,10 +89,6 @@ export class StreamingService extends SimpleEmitter {
   private captureContext: CanvasRenderingContext2D | null = null;
   private captureInterval: number | null = null;
   private _stopping = false;
-  private audioContext: AudioContext | null = null;
-  private audioEncoder: AudioEncoder | null = null;
-  private audioTimestamp = 0;
-  private frameCount = 0;
 
   constructor() {
     super();
@@ -107,7 +107,7 @@ export class StreamingService extends SimpleEmitter {
   }
 
   static isSupported(): boolean {
-    return typeof OffscreenCanvas !== "undefined";
+    return typeof MediaRecorder !== "undefined";
   }
 
   async connect(serverUrl: string): Promise<void> {
@@ -156,7 +156,7 @@ export class StreamingService extends SimpleEmitter {
 
   async startStream(config: StreamConfig): Promise<void> {
     if (!StreamingService.isSupported()) {
-      throw new StreamingError("OffscreenCanvas not supported in this browser");
+      throw new StreamingError("MediaRecorder not supported in this browser");
     }
 
     const currentStatus = this.status;
@@ -172,8 +172,6 @@ export class StreamingService extends SimpleEmitter {
     this.startTime = Date.now();
     this.pausedTime = 0;
     this._stopping = false;
-    this.frameCount = 0;
-    this.audioTimestamp = 0;
 
     try {
       const sourceCanvas = this.findCanvas();
@@ -186,11 +184,24 @@ export class StreamingService extends SimpleEmitter {
       this.captureCanvas = document.createElement("canvas");
       this.captureCanvas.width = quality.width;
       this.captureCanvas.height = quality.height;
-      this.captureContext = this.captureCanvas.getContext("2d", { alpha: false, willReadFrequently: false });
+      this.captureContext = this.captureCanvas.getContext("2d", { alpha: false });
       if (!this.captureContext) throw new StreamingError("Could not create canvas context");
 
       this.captureContext.fillStyle = "#000000";
       this.captureContext.fillRect(0, 0, quality.width, quality.height);
+
+      this.canvasStream = this.captureCanvas.captureStream(quality.fps);
+
+      await this.setupAudio(config.audio);
+
+      this.combinedStream = new MediaStream();
+      this.canvasStream.getVideoTracks().forEach(track => this.combinedStream!.addTrack(track));
+      
+      if (this.audioStream) {
+        this.audioStream.getAudioTracks().forEach(track => this.combinedStream!.addTrack(track));
+      }
+
+      console.log(`[Streaming] Combined stream has ${this.combinedStream.getTracks().length} tracks`);
 
       const streamConfig = {
         type: "start",
@@ -202,18 +213,16 @@ export class StreamingService extends SimpleEmitter {
           width: quality.width,
           height: quality.height,
           fps: quality.fps,
-          hasAudio: config.audio.includeMicrophone || config.audio.includeProjectAudio,
+          hasAudio: !!this.audioStream,
           amdDriver: config.amdDriver || "auto",
         },
       };
       console.log("[Streaming] Sending config to server:", JSON.stringify(streamConfig.data));
       this.websocket.send(JSON.stringify(streamConfig));
 
-      if (config.audio.includeMicrophone || config.audio.includeProjectAudio) {
-        await this.initAudioEncoder(config.audio);
-      }
+      await this.startMediaRecorder();
 
-      this.startFrameCapture(sourceCanvas, quality);
+      this.startFrameCapture(sourceCanvas);
 
       this.setStatus("live");
       this.startStatsInterval();
@@ -229,10 +238,12 @@ export class StreamingService extends SimpleEmitter {
     }
   }
 
-  private async initAudioEncoder(audioConfig: AudioConfig): Promise<void> {
-    console.log("[Streaming] Initializing audio encoder...");
+  private async setupAudio(audioConfig: AudioConfig): Promise<void> {
+    if (!audioConfig.includeProjectAudio && !audioConfig.includeMicrophone) {
+      return;
+    }
+
     try {
-      this.audioContext = new AudioContext({ sampleRate: 48000 });
       const audioTracks: MediaStreamTrack[] = [];
 
       if (audioConfig.includeMicrophone) {
@@ -247,8 +258,9 @@ export class StreamingService extends SimpleEmitter {
           const audioGraph = coreMod.getRealtimeAudioGraph();
           const audioCtx = (audioGraph as unknown as { getAudioContext(): AudioContext | null }).getAudioContext?.() ?? null;
           const masterGain = (audioGraph as unknown as { getMasterGain(): GainNode | null }).getMasterGain?.() ?? null;
+          
           if (audioCtx && masterGain) {
-            const dest = this.audioContext.createMediaStreamDestination();
+            const dest = audioCtx.createMediaStreamDestination();
             masterGain.connect(dest);
             dest.stream.getAudioTracks().forEach(track => audioTracks.push(track));
             console.log("[Streaming] Project audio added");
@@ -258,140 +270,135 @@ export class StreamingService extends SimpleEmitter {
         }
       }
 
-      if (audioTracks.length === 0) {
-        console.log("[Streaming] No audio tracks available");
-        return;
+      if (audioTracks.length > 0) {
+        this.audioStream = new MediaStream(audioTracks);
       }
-
-      const source = this.audioContext.createMediaStreamSource(new MediaStream(audioTracks));
-
-      this.audioEncoder = new AudioEncoder({
-        output: (chunk, _metadata) => {
-          if (!this.websocket || this.websocket.readyState !== WebSocket.OPEN) return;
-          const buffer = new ArrayBuffer(chunk.byteLength);
-          chunk.copyTo(buffer);
-          const data = new Uint8Array(buffer);
-          this.sendAudioFrame(data, chunk.timestamp);
-        },
-        error: (e) => console.error("[Streaming] AudioEncoder error:", e),
-      });
-
-      const supported = await AudioEncoder.isConfigSupported({
-        codec: "mp4a.40.2",
-        sampleRate: 48000,
-        numberOfChannels: 2,
-        bitrate: 128000,
-      });
-
-      if (!supported.supported) {
-        console.warn("[Streaming] AAC encoder not supported, skipping audio");
-        return;
-      }
-
-      this.audioEncoder.configure({
-        codec: "mp4a.40.2",
-        sampleRate: 48000,
-        numberOfChannels: 2,
-        bitrate: 128000,
-      });
-
-      const bufferSize = 1024;
-      const processor = this.audioContext.createScriptProcessor(bufferSize, 2, 2);
-      processor.onaudioprocess = (event) => {
-        if (!this.audioEncoder || this.audioEncoder.state !== "configured") return;
-        const inputBuffer = event.inputBuffer;
-        const samplesL = inputBuffer.getChannelData(0);
-        const samplesR = inputBuffer.getChannelData(1) || samplesL;
-        const interleaved = new Float32Array(inputBuffer.length * 2);
-        for (let i = 0; i < inputBuffer.length; i++) {
-          interleaved[i * 2] = samplesL[i];
-          interleaved[i * 2 + 1] = samplesR[i];
-        }
-        const audioData = new AudioData({
-          format: "f32-planar",
-          sampleRate: 48000,
-          numberOfFrames: inputBuffer.length,
-          numberOfChannels: 2,
-          timestamp: this.audioTimestamp,
-          data: new Float32Array(samplesL),
-        });
-        this.audioEncoder.encode(audioData);
-        audioData.close();
-        this.audioTimestamp += (inputBuffer.length / 48000) * 1_000_000;
-      };
-
-      source.connect(processor);
-      processor.connect(this.audioContext.destination);
-      console.log("[Streaming] Audio encoder configured");
     } catch (err) {
-      console.warn("[Streaming] Audio encoder setup failed:", err);
+      console.error("[Streaming] Audio setup failed:", err);
     }
   }
 
-  private sendAudioFrame(data: Uint8Array, timestamp: number): void {
-    if (!this.websocket || this.websocket.readyState !== WebSocket.OPEN) return;
-    const header = new Uint8Array(12);
-    const view = new DataView(header.buffer);
-    view.setUint8(0, 0x02);
-    view.setUint32(2, data.length);
-    view.setBigUint64(6, BigInt(Math.floor(timestamp)));
-    this.websocket.send(header);
-    this.websocket.send(data);
+  private async startMediaRecorder(): Promise<void> {
+    if (!this.combinedStream || !this.websocket) {
+      throw new StreamingError("Stream or WebSocket not ready");
+    }
+
+    const hasAudio = this.audioStream !== null;
+    const types = hasAudio ? [
+      "video/webm;codecs=vp8,opus",
+      "video/webm",
+    ] : [
+      "video/webm;codecs=vp8",
+      "video/webm",
+    ];
+
+    let mimeType = "";
+    for (const type of types) {
+      if (MediaRecorder.isTypeSupported(type)) {
+        mimeType = type;
+        break;
+      }
+    }
+
+    if (!mimeType) {
+      throw new StreamingError("No supported MediaRecorder MIME type found");
+    }
+
+    console.log("[Streaming] MediaRecorder MIME type:", mimeType);
+
+    const bitrate = this.config ? QUALITY_MAP[this.config.quality].bitrate : 6_000_000;
+
+    this.mediaRecorder = new MediaRecorder(this.combinedStream, {
+      mimeType,
+      videoBitsPerSecond: bitrate,
+    });
+
+    this.mediaRecorder.ondataavailable = async (event) => {
+      const size = event.data?.size ?? 0;
+      const wsState = this.websocket?.readyState;
+      console.log(`[Streaming] ondataavailable: size=${size}bytes, wsState=${wsState}, recorderState=${this.mediaRecorder?.state}`);
+      if (event.data && event.data.size > 0 && this.websocket?.readyState === WebSocket.OPEN) {
+        try {
+          const buffer = await event.data.arrayBuffer();
+          const uint8Array = new Uint8Array(buffer);
+          this.websocket.send(uint8Array);
+          this.stats.framesSent++;
+          if (this.stats.framesSent <= 5) {
+            console.log(`[Streaming] Sent chunk #${this.stats.framesSent}: ${uint8Array.length} bytes`);
+          }
+        } catch (e) {
+          console.error("[Streaming] Failed to send data:", e);
+        }
+      } else {
+        if (!event.data || event.data.size === 0) {
+          console.warn("[Streaming] Empty data chunk received");
+        } else if (this.websocket?.readyState !== WebSocket.OPEN) {
+          console.warn(`[Streaming] WebSocket not open (state: ${this.websocket?.readyState})`);
+        }
+      }
+    };
+
+    this.mediaRecorder.onerror = (event) => {
+      console.error("[Streaming] MediaRecorder error:", event);
+      this.emit("error", "MediaRecorder error");
+    };
+
+    this.mediaRecorder.start(1000);
+    console.log("[Streaming] MediaRecorder started");
   }
 
-  private startFrameCapture(sourceCanvas: HTMLCanvasElement, quality: { width: number; height: number; fps: number }): void {
-    if (!this.captureContext || !this.captureCanvas) return;
+  private startFrameCapture(sourceCanvas: HTMLCanvasElement): void {
+    if (!this.captureCanvas || !this.captureContext) return;
 
+    const quality = this.config ? QUALITY_MAP[this.config.quality] : { width: 1920, height: 1080, fps: 30 };
     const targetFps = quality.fps;
-    const frameInterval = 1_000 / targetFps;
+    const frameInterval = 1000 / targetFps;
     let lastFrameTime = performance.now();
+
     let consecutiveErrors = 0;
     const maxConsecutiveErrors = 10;
-
+    
     const captureLoop = (currentTime: number) => {
       if (!this.captureContext || !this.captureCanvas || this._stopping) return;
 
       const delta = currentTime - lastFrameTime;
-
+      
       if (delta >= frameInterval) {
         lastFrameTime = currentTime - (delta % frameInterval);
-
+        
         try {
           if (!sourceCanvas || sourceCanvas.width === 0 || sourceCanvas.height === 0) {
             const newCanvas = this.findCanvas();
             if (newCanvas && newCanvas !== sourceCanvas) {
+              console.log("[Streaming] Canvas reference updated");
               sourceCanvas = newCanvas;
             } else if (!newCanvas) {
               throw new Error("Canvas not found");
             }
           }
-
+          
           this.captureContext.fillStyle = "#000000";
           this.captureContext.fillRect(0, 0, quality.width, quality.height);
+          
           this.captureContext.drawImage(
-            sourceCanvas,
+            sourceCanvas, 
             0, 0, sourceCanvas.width, sourceCanvas.height,
             0, 0, quality.width, quality.height
           );
-
-          this.captureCanvas.toBlob((blob) => {
-            if (!blob || !this.websocket || this.websocket.readyState !== WebSocket.OPEN) return;
-            blob.arrayBuffer().then(buf => {
-              const data = new Uint8Array(buf);
-              this.sendVideoFrame(data);
-            });
-          }, "image/jpeg", 0.92);
-
+          
           this.stats.framesEncoded++;
-          this.frameCount++;
           consecutiveErrors = 0;
         } catch (e) {
           consecutiveErrors++;
+          console.error(`[Streaming] Frame capture error #${consecutiveErrors}:`, e);
+          
           if (consecutiveErrors >= maxConsecutiveErrors) {
+            console.error("[Streaming] Too many frame errors, attempting recovery...");
             const recoveredCanvas = this.findCanvas();
             if (recoveredCanvas && recoveredCanvas !== sourceCanvas) {
               sourceCanvas = recoveredCanvas;
               consecutiveErrors = 0;
+              console.log("[Streaming] Canvas recovered, continuing stream");
             }
           }
         }
@@ -401,26 +408,7 @@ export class StreamingService extends SimpleEmitter {
     };
 
     this.captureInterval = requestAnimationFrame(captureLoop);
-    console.log("[Streaming] Frame capture started at", targetFps, "FPS (JPEG frames)");
-  }
-
-  private sendVideoFrame(data: Uint8Array): void {
-    if (!this.websocket || this.websocket.readyState !== WebSocket.OPEN) return;
-
-    const header = new Uint8Array(12);
-    const view = new DataView(header.buffer);
-    view.setUint8(0, 0x01);
-    view.setUint8(1, 0x00);
-    view.setUint32(2, data.length);
-    view.setBigUint64(6, BigInt(Date.now()));
-
-    this.websocket.send(header);
-    this.websocket.send(data);
-    this.stats.framesSent++;
-
-    if (this.stats.framesSent <= 3) {
-      console.log(`[Streaming] Sent JPEG frame #${this.stats.framesSent}: ${data.length} bytes`);
-    }
+    console.log("[Streaming] Frame capture started at", targetFps, "FPS");
   }
 
   stopStream(): void {
@@ -428,20 +416,30 @@ export class StreamingService extends SimpleEmitter {
     this._stopping = true;
     this.stopStatsInterval();
 
-    if (this.audioEncoder && this.audioEncoder.state !== "closed") {
-      this.audioEncoder.flush().catch(() => {});
-      this.audioEncoder.close();
+    if (this.mediaRecorder && this.mediaRecorder.state !== "inactive") {
+      try {
+        this.mediaRecorder.stop();
+      } catch { /* ignore */ }
     }
-    this.audioEncoder = null;
-
-    if (this.audioContext) {
-      this.audioContext.close();
-      this.audioContext = null;
-    }
+    this.mediaRecorder = null;
 
     if (this.captureInterval) {
       cancelAnimationFrame(this.captureInterval);
       this.captureInterval = null;
+    }
+
+    if (this.canvasStream) {
+      this.canvasStream.getTracks().forEach(track => track.stop());
+      this.canvasStream = null;
+    }
+
+    if (this.audioStream) {
+      this.audioStream.getTracks().forEach(track => track.stop());
+      this.audioStream = null;
+    }
+
+    if (this.combinedStream) {
+      this.combinedStream = null;
     }
 
     this.captureCanvas = null;
@@ -460,6 +458,11 @@ export class StreamingService extends SimpleEmitter {
     if (this.status !== "live") return;
     this.pauseStart = Date.now();
     this.setStatus("paused");
+    
+    if (this.mediaRecorder && this.mediaRecorder.state === "recording") {
+      this.mediaRecorder.pause();
+    }
+    
     this.emit("pause");
   }
 
@@ -467,6 +470,11 @@ export class StreamingService extends SimpleEmitter {
     if (this.status !== "paused") return;
     this.pausedTime += Date.now() - this.pauseStart;
     this.setStatus("live");
+    
+    if (this.mediaRecorder && this.mediaRecorder.state === "paused") {
+      this.mediaRecorder.resume();
+    }
+    
     this.emit("resume");
   }
 
@@ -498,7 +506,7 @@ export class StreamingService extends SimpleEmitter {
     try {
       const msg: WebSocketMessage = JSON.parse(data);
       console.log("[Streaming] Server message:", msg.type);
-
+      
       if (msg.type === "stats") {
         this.stats = { ...this.stats, ...(msg.data as Partial<StreamStats>) };
         this.emit("stats", this.getStats());
@@ -532,7 +540,7 @@ export class StreamingService extends SimpleEmitter {
       "div.relative canvas",
       "div[class*='bg-black'] canvas",
     ];
-
+    
     for (const sel of selectors) {
       const el = document.querySelector<HTMLCanvasElement>(sel);
       if (el && el.width > 0 && el.height > 0) {
@@ -540,7 +548,7 @@ export class StreamingService extends SimpleEmitter {
         return el;
       }
     }
-
+    
     const allCanvases = document.querySelectorAll<HTMLCanvasElement>("canvas");
     for (const canvas of allCanvases) {
       if (canvas.width >= 640 && canvas.height >= 360) {
@@ -548,7 +556,7 @@ export class StreamingService extends SimpleEmitter {
         return canvas;
       }
     }
-
+    
     console.log("[Streaming] No suitable canvas found");
     return null;
   }

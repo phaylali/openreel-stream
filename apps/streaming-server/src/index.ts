@@ -1,8 +1,13 @@
 import { WebSocketServer, WebSocket } from "ws";
 import { spawn, execSync, ChildProcess } from "child_process";
-import { existsSync } from "fs";
+import { existsSync, writeFileSync, unlinkSync, mkdirSync, openSync, writeSync, closeSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+import { createServer, IncomingMessage, ServerResponse } from "http";
+import { URL } from "url";
 
 const PORT = parseInt(process.env.PORT || "8081", 10);
+const HTTP_PORT = PORT + 1;
 
 interface StreamSession {
   ws: WebSocket;
@@ -16,12 +21,8 @@ interface StreamSession {
   rtmpConnectTime: number | null;
   totalBytesReceived: number;
   framesReceived: number;
-  frameBuffer: Buffer[];
-  frameSize: number;
-  frameTimestamp: number;
-  parsingHeader: boolean;
-  headerBytesRead: number;
-  audioEncoderRunning: boolean;
+  fifoPath: string;
+  fifoFd: number | null;
 }
 
 interface StreamConfig {
@@ -89,7 +90,7 @@ function checkAMDGPU(driverPreference: "mesa" | "vulkan" | "auto" = "auto"): { a
   return { available: false, device: null, driver: "none" };
 }
 
-function buildFFmpegArgs(config: StreamConfig, amdGpu: { available: boolean; device: string | null; driver: string }): string[] {
+function buildFFmpegArgs(config: StreamConfig, amdGpu: { available: boolean; device: string | null; driver: string }, fifoPath: string): string[] {
   const args: string[] = [
     "-hide_banner",
     "-loglevel", "verbose",
@@ -101,9 +102,9 @@ function buildFFmpegArgs(config: StreamConfig, amdGpu: { available: boolean; dev
   log(`Stream config: ${config.width}x${config.height} @ ${config.fps}fps, ${bitrateK} bitrate, driver: ${amdGpu.driver}`);
 
   args.push(
-    "-f", "image2pipe",
-    "-framerate", config.fps.toString(),
-    "-i", "pipe:0",
+    "-re",
+    "-f", "webm",
+    "-i", fifoPath,
   );
 
   if (amdGpu.available && amdGpu.device) {
@@ -149,13 +150,7 @@ function buildFFmpegArgs(config: StreamConfig, amdGpu: { available: boolean; dev
 
   const rtmpUrl = buildRtmpUrl(config.ingestUrl, config.streamKey);
   args.push(
-    "-f", "fifo",
-    "-fifo_format", "flv",
-    "-attempt_recovery", "1",
-    "-recover_any_error", "1",
-    "-recovery_wait_time", "1",
-    "-drop_pkts_on_overflow", "1",
-    "-max_recovery_attempts", "0",
+    "-f", "flv",
     "-flvflags", "no_duration_filesize",
     rtmpUrl,
   );
@@ -187,7 +182,7 @@ function startFFmpeg(session: StreamSession): ChildProcess | null {
     log("GPU encoding: Not available, using CPU");
   }
 
-  const ffmpegArgs = buildFFmpegArgs(config, amdGpu);
+  const ffmpegArgs = buildFFmpegArgs(config, amdGpu, session.fifoPath);
   log("FFmpeg args:", ffmpegArgs.join(" "));
 
   const ffmpeg = spawn("ffmpeg", ffmpegArgs, {
@@ -294,18 +289,10 @@ async function handleMessage(ws: WebSocket, sessionId: string, msg: WSMessage) {
       session.rtmpConnectTime = null;
       session.totalBytesReceived = 0;
       session.framesReceived = 0;
-      session.frameBuffer = [];
-      session.frameSize = 0;
-      session.frameTimestamp = 0;
-      session.parsingHeader = true;
-      session.headerBytesRead = 0;
-      session.audioEncoderRunning = false;
 
-      session.ffmpeg = startFFmpeg(session);
-      if (!session.ffmpeg) {
-        ws.send(JSON.stringify({ type: "error", data: "Failed to start FFmpeg" }));
-        return;
-      }
+      writeFileSync(session.fifoPath, Buffer.alloc(0));
+      session.fifoFd = openSync(session.fifoPath, "a");
+      log(`WebM file created: ${session.fifoPath}`);
 
       log(`Stream started: ${sessionId}, quality: ${data.quality}`);
       ws.send(JSON.stringify({ type: "started" }));
@@ -337,8 +324,9 @@ async function handleMessage(ws: WebSocket, sessionId: string, msg: WSMessage) {
     case "stop": {
       log(`Stream stopping: ${sessionId}`);
 
-      if (session.ffmpeg && session.ffmpeg.stdin && !session.ffmpeg.stdin.destroyed) {
-        session.ffmpeg.stdin.end();
+      if (session.fifoFd !== null) {
+        try { closeSync(session.fifoFd); } catch {}
+        session.fifoFd = null;
       }
 
       if (session.ffmpeg) {
@@ -383,6 +371,7 @@ wss.on("listening", () => {
 
 wss.on("connection", (ws, req) => {
   const sessionId = Math.random().toString(36).slice(2, 10);
+  const fifoPath = join(tmpdir(), `stream-${sessionId}.webm`);
 
   const session: StreamSession = {
     ws,
@@ -396,12 +385,8 @@ wss.on("connection", (ws, req) => {
     rtmpConnectTime: null,
     totalBytesReceived: 0,
     framesReceived: 0,
-    frameBuffer: [],
-    frameSize: 0,
-    frameTimestamp: 0,
-    parsingHeader: true,
-    headerBytesRead: 0,
-    audioEncoderRunning: false,
+    fifoPath,
+    fifoFd: null,
   };
 
   sessions.set(sessionId, session);
@@ -424,53 +409,30 @@ wss.on("connection", (ws, req) => {
           return;
         }
 
-        if (!session.ffmpeg || !session.ffmpeg.stdin || session.ffmpeg.stdin.destroyed) {
-          error(`Cannot write data: FFmpeg not running`);
+        if (session.fifoFd === null) {
+          error(`Cannot write data: file not open`);
           return;
         }
 
-        session.totalBytesReceived += data.length;
+        try {
+          writeSync(session.fifoFd, data);
+          session.totalBytesReceived += data.length;
+          session.framesReceived++;
 
-        if (data.length === 12) {
-          const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-          const typeByte = view.getUint8(0);
-          const length = view.getUint32(2);
-          const timestamp = Number(view.getBigUint64(6));
-
-          if (typeByte === 0x01) {
-            session.frameSize = length;
-            session.frameTimestamp = timestamp;
-            session.frameBuffer = [];
-            session.parsingHeader = false;
-            session.headerBytesRead = 0;
-            session.framesReceived++;
-          } else if (typeByte === 0x02) {
-            session.audioEncoderRunning = true;
-            session.frameSize = length;
-            session.frameBuffer = [];
-            session.parsingHeader = false;
-            session.headerBytesRead = 0;
-          }
-          return;
-        }
-
-        if (!session.parsingHeader && session.frameSize > 0) {
-          session.frameBuffer.push(data);
-          session.headerBytesRead += data.length;
-
-          if (session.headerBytesRead >= session.frameSize) {
-            const frameData = Buffer.concat(session.frameBuffer);
-            session.ffmpeg.stdin.write(frameData);
-
-            if (!session.hasReceivedData) {
-              log(`✓ First video frame received for ${sessionId}, size: ${frameData.length} bytes`);
-              session.hasReceivedData = true;
+          if (!session.hasReceivedData) {
+            log(`✓ First WebM chunk received for ${sessionId}, size: ${data.length} bytes`);
+            session.hasReceivedData = true;
+            
+            if (!session.ffmpeg) {
+              session.ffmpeg = startFFmpeg(session);
+              if (!session.ffmpeg) {
+                ws.send(JSON.stringify({ type: "error", data: "Failed to start FFmpeg" }));
+                return;
+              }
             }
-
-            session.frameBuffer = [];
-            session.frameSize = 0;
-            session.headerBytesRead = 0;
           }
+        } catch (e) {
+          error(`Failed to write WebM data: ${e}`);
         }
       }
     } catch (e) {
@@ -481,8 +443,9 @@ wss.on("connection", (ws, req) => {
   ws.on("close", () => {
     log(`Client disconnected: ${sessionId}`);
 
-    if (session.ffmpeg && session.ffmpeg.stdin && !session.ffmpeg.stdin.destroyed) {
-      session.ffmpeg.stdin.end();
+    if (session.fifoFd !== null) {
+      try { closeSync(session.fifoFd); } catch {}
+      session.fifoFd = null;
     }
 
     if (session.ffmpeg && !session.ffmpeg.killed) {
@@ -514,4 +477,40 @@ process.on("SIGINT", () => {
   }
   wss.close();
   process.exit(0);
+});
+
+const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+  const url = new URL(req.url || "/", `http://${req.headers.host}`);
+
+  if (url.pathname === "/api/twitch/live" && req.method === "GET") {
+    const channel = url.searchParams.get("channel");
+    if (!channel) {
+      res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ error: "Missing channel parameter" }));
+      return;
+    }
+
+    try {
+      const clientId = url.searchParams.get("client_id") || "kimne78kx3ncx6brgo4mv6wki5h1ko";
+      const twitchRes = await fetch(`https://api.twitch.tv/helix/streams?user_login=${encodeURIComponent(channel)}`, {
+        headers: { "Client-ID": clientId },
+      });
+      const body: unknown = await twitchRes.json();
+      const twitchData = body as { data?: unknown[] };
+      const isLive = twitchData.data && twitchData.data.length > 0;
+
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ channel, isLive, data: twitchData.data }));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ error: String(err) }));
+    }
+  } else {
+    res.writeHead(404, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+    res.end(JSON.stringify({ error: "Not found" }));
+  }
+});
+
+httpServer.listen(HTTP_PORT, () => {
+  log(`HTTP API server listening on port ${HTTP_PORT}`);
 });
