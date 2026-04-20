@@ -1,28 +1,29 @@
 import { WebSocketServer, WebSocket } from "ws";
-import { spawn, execSync, ChildProcess } from "child_process";
-import { existsSync, writeFileSync, unlinkSync, mkdirSync, openSync, writeSync, closeSync } from "fs";
-import { tmpdir } from "os";
-import { join } from "path";
+import { execSync } from "child_process";
+import { existsSync } from "fs";
+import { createRequire } from "module";
 import { createServer, IncomingMessage, ServerResponse } from "http";
 import { URL } from "url";
+
+const require = createRequire(import.meta.url);
+const gstreamer = require("gstreamer-superficial");
 
 const PORT = parseInt(process.env.PORT || "8081", 10);
 const HTTP_PORT = PORT + 1;
 
 interface StreamSession {
   ws: WebSocket;
-  ffmpeg: ChildProcess | null;
+  pipeline: any;
+  appsrc: any;
   config: StreamConfig | null;
   startTime: number;
   hasReceivedData: boolean;
-  lastFFmpegLog?: number;
-  restartCount?: number;
+  lastLog?: number;
   rtmpConnected: boolean;
   rtmpConnectTime: number | null;
   totalBytesReceived: number;
   framesReceived: number;
-  fifoPath: string;
-  fifoFd: number | null;
+  useGpu: boolean;
 }
 
 interface StreamConfig {
@@ -90,72 +91,34 @@ function checkAMDGPU(driverPreference: "mesa" | "vulkan" | "auto" = "auto"): { a
   return { available: false, device: null, driver: "none" };
 }
 
-function buildFFmpegArgs(config: StreamConfig, amdGpu: { available: boolean; device: string | null; driver: string }, fifoPath: string): string[] {
-  const args: string[] = [
-    "-hide_banner",
-    "-loglevel", "verbose",
-  ];
-
+function buildGstPipeline(config: StreamConfig, useGpu: boolean): string {
   const gopSize = config.fps * 2;
-  const bitrateK = Math.round(config.bitrate / 1000) + "k";
+  const bitrateK = Math.round(config.bitrate / 1000);
 
-  log(`Stream config: ${config.width}x${config.height} @ ${config.fps}fps, ${bitrateK} bitrate, driver: ${amdGpu.driver}`);
+  log(`GStreamer config: ${config.width}x${config.height} @ ${config.fps}fps, ${bitrateK}k bitrate, GPU: ${useGpu}`);
 
-  args.push(
-    "-re",
-    "-f", "webm",
-    "-i", fifoPath,
-  );
-
-  if (amdGpu.available && amdGpu.device) {
-    log(`Using AMD VCN hardware encoder (h264_vaapi) with ${amdGpu.driver} driver`);
-    args.push(
-      "-vaapi_device", amdGpu.device,
-      "-vf", `format=nv12|vaapi,hwupload,scale_vaapi=w=${config.width}:h=${config.height}`,
-      "-c:v", "h264_vaapi",
-      "-qp:v", "23",
-      "-bf", "0",
-      "-rc_mode", "CBR",
-    );
-  } else {
-    log(`AMD GPU not available, using CPU encoding (libx264)`);
-    args.push(
-      "-vf", `scale=${config.width}:${config.height}`,
-      "-c:v", "libx264",
-      "-preset", "ultrafast",
-      "-tune", "zerolatency",
-    );
-  }
-
-  args.push(
-    "-b:v", bitrateK,
-    "-maxrate", bitrateK,
-    "-bufsize", Math.round(config.bitrate * 2 / 1000) + "k",
-    "-r", config.fps.toString(),
-    "-g", gopSize.toString(),
-    "-keyint_min", gopSize.toString(),
-    "-sc_threshold", "0",
-  );
-
-  if (config.hasAudio) {
-    args.push(
-      "-c:a", "aac",
-      "-b:a", "128k",
-      "-ar", "48000",
-      "-ac", "2",
-    );
-  } else {
-    args.push("-an");
-  }
+  const encoder = useGpu
+    ? `vah264enc bitrate=${bitrateK} target-usage=4 ! video/x-h264,profile=main,level=(string)4.0`
+    : `x264enc bitrate=${bitrateK} speed-preset=ultrafast tune=zerolatency ! video/x-h264,profile=main,level=(string)4.0`;
 
   const rtmpUrl = buildRtmpUrl(config.ingestUrl, config.streamKey);
-  args.push(
-    "-f", "flv",
-    "-flvflags", "no_duration_filesize",
-    rtmpUrl,
-  );
 
-  return args;
+  let pipeline = `appsrc name=src format=time is-live=true block=false ! ` +
+    `matroskademux name=demux ` +
+    `demux. ! queue ! vp8dec ! videoconvert ! video/x-raw,format=NV12 ! ${encoder} ! ` +
+    `h264parse ! ` +
+    `flvmux name=mux streamable=true ! ` +
+    `queue ! ` +
+    `rtmpsink location="${rtmpUrl}"`;
+
+  if (config.hasAudio) {
+    pipeline = pipeline.replace(
+      `flvmux name=mux streamable=true`,
+      `demux. ! queue ! opusdec ! audioconvert ! audioresample ! audio/x-raw,format=S16LE,rate=48000,channels=2 ! voaacenc bitrate=128000 ! aacparse ! flvmux name=mux streamable=true`
+    );
+  }
+
+  return pipeline;
 }
 
 function buildRtmpUrl(ingestUrl: string, streamKey: string): string {
@@ -163,114 +126,63 @@ function buildRtmpUrl(ingestUrl: string, streamKey: string): string {
   return `${base}/${streamKey}`;
 }
 
-function startFFmpeg(session: StreamSession): ChildProcess | null {
+function startGStreamer(session: StreamSession): boolean {
   if (!session.config) {
     error("No config for session");
-    return null;
+    return false;
   }
 
   const config = session.config;
   const driverPreference = config.amdDriver || "auto";
   const amdGpu = checkAMDGPU(driverPreference);
 
-  const rtmpUrl = buildRtmpUrl(config.ingestUrl, config.streamKey);
-  log(`Starting FFmpeg, RTMP: ${rtmpUrl.replace(config.streamKey, "***")}`);
+  session.useGpu = amdGpu.available;
+  const pipelineStr = buildGstPipeline(config, session.useGpu);
 
-  if (amdGpu.available) {
-    log(`GPU encoding: AMD VCN on ${amdGpu.device} using ${amdGpu.driver} driver`);
+  const rtmpUrl = buildRtmpUrl(config.ingestUrl, config.streamKey);
+  log(`Starting GStreamer, RTMP: ${rtmpUrl.replace(config.streamKey, "***")}`);
+  log(`Pipeline: ${pipelineStr}`);
+
+  if (session.useGpu) {
+    log(`GPU encoding: VA-API H.264 on ${amdGpu.device} using ${amdGpu.driver} driver`);
   } else {
-    log("GPU encoding: Not available, using CPU");
+    log(`GPU encoding: Not available, using CPU (x264enc)`);
   }
 
-  const ffmpegArgs = buildFFmpegArgs(config, amdGpu, session.fifoPath);
-  log("FFmpeg args:", ffmpegArgs.join(" "));
+  try {
+    session.pipeline = new gstreamer.Pipeline(pipelineStr);
 
-  const ffmpeg = spawn("ffmpeg", ffmpegArgs, {
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-
-  ffmpeg.stderr.on("data", (data) => {
-    const str = data.toString().trim();
-
-    if (str.includes("Opening") && str.includes("for writing")) {
-      log("🎬 FFmpeg: Opening RTMP connection to Twitch...");
+    session.appsrc = session.pipeline.findChild("src");
+    if (!session.appsrc) {
+      error("Could not find appsrc element in pipeline");
+      return false;
     }
-    else if (str.includes("Connected")) {
-      session.rtmpConnected = true;
-      session.rtmpConnectTime = Date.now();
-      log("✅ RTMP CONNECTED TO TWITCH! Stream is live on Twitch!");
+
+    session.appsrc.set("caps", `video/x-vp8,width=${config.width},height=${config.height},framerate=${config.fps}/1`);
+
+    session.pipeline.on("error", (err: Error) => {
+      error("GStreamer pipeline error:", err);
       session.ws.send(JSON.stringify({
-        type: "stats",
-        data: { rtmpConnected: true, rtmpConnectTime: session.rtmpConnectTime },
+        type: "error",
+        data: `GStreamer error: ${err.message}`
       }));
-    }
-    else if (str.includes("Error") || str.includes("error") || str.includes("broken") || str.includes("pipe") || str.includes("failed") || str.includes("disconnect")) {
-      error("FFmpeg:", str.slice(0, 400));
-      if (str.includes("Connection refused") || str.includes("Connection reset")) {
-        session.rtmpConnected = false;
-        session.ws.send(JSON.stringify({
-          type: "error",
-          data: "RTMP connection to Twitch lost. Check your stream key and ingest URL.",
-        }));
-      }
-    }
-    else if (str.includes("speed=") || str.includes("frame=") || str.includes("bitrate=")) {
-      const now = Date.now();
-      if (!session.lastFFmpegLog || now - session.lastFFmpegLog > 15000) {
-        log("📊 FFmpeg status:", str.slice(0, 150));
-        session.lastFFmpegLog = now;
-      }
-    }
-    else if (!session.hasReceivedData) {
-      log("FFmpeg init:", str.slice(0, 200));
-    }
-  });
+    });
 
-  ffmpeg.stdin?.on("error", (err) => {
-    if ((err as NodeJS.ErrnoException).code === "EPIPE") {
-      debug("FFmpeg stdin EPIPE (expected on exit)");
-    } else {
-      error(`FFmpeg stdin error: ${err.message}`);
-    }
-  });
+    session.pipeline.on("eos", () => {
+      log("GStreamer EOS received");
+    });
 
-  ffmpeg.stdout.on("data", (data) => {
-    log("FFmpeg stdout:", data.toString().slice(0, 100));
-  });
-
-  ffmpeg.on("error", (err) => {
-    error(`FFmpeg spawn error: ${err.message}`);
+    session.pipeline.setPlaying(true);
+    log("GStreamer pipeline started");
+    return true;
+  } catch (err) {
+    error(`Failed to create GStreamer pipeline: ${err}`);
     session.ws.send(JSON.stringify({
       type: "error",
-      data: `FFmpeg error: ${err.message}`
+      data: `GStreamer error: ${err}`
     }));
-  });
-
-  ffmpeg.on("exit", (code) => {
-    log(`🔴 FFmpeg exited with code ${code}`);
-    if (session.rtmpConnected) {
-      log("📡 Stream was successfully sent to Twitch before FFmpeg exited");
-    }
-    session.ffmpeg = null;
-
-    if (code !== 0 && code !== null) {
-      log(`FFmpeg crashed with code ${code}`);
-
-      if (session.ws.readyState === WebSocket.OPEN) {
-        session.ws.send(JSON.stringify({
-          type: "error",
-          data: `FFmpeg crashed (code ${code}). Please stop and restart stream.`
-        }));
-        session.ws.send(JSON.stringify({ type: "stopped" }));
-      }
-    } else {
-      if (session.ws.readyState === WebSocket.OPEN) {
-        session.ws.send(JSON.stringify({ type: "stopped" }));
-      }
-    }
-  });
-
-  return ffmpeg;
+    return false;
+  }
 }
 
 async function handleMessage(ws: WebSocket, sessionId: string, msg: WSMessage) {
@@ -289,10 +201,6 @@ async function handleMessage(ws: WebSocket, sessionId: string, msg: WSMessage) {
       session.rtmpConnectTime = null;
       session.totalBytesReceived = 0;
       session.framesReceived = 0;
-
-      writeFileSync(session.fifoPath, Buffer.alloc(0));
-      session.fifoFd = openSync(session.fifoPath, "a");
-      log(`WebM file created: ${session.fifoPath}`);
 
       log(`Stream started: ${sessionId}, quality: ${data.quality}`);
       ws.send(JSON.stringify({ type: "started" }));
@@ -324,17 +232,17 @@ async function handleMessage(ws: WebSocket, sessionId: string, msg: WSMessage) {
     case "stop": {
       log(`Stream stopping: ${sessionId}`);
 
-      if (session.fifoFd !== null) {
-        try { closeSync(session.fifoFd); } catch {}
-        session.fifoFd = null;
-      }
-
-      if (session.ffmpeg) {
-        setTimeout(() => {
-          if (session.ffmpeg && !session.ffmpeg.killed) {
-            session.ffmpeg.kill("SIGTERM");
-          }
-        }, 2000);
+      if (session.pipeline) {
+        try {
+          session.pipeline.sendEos();
+          setTimeout(() => {
+            if (session.pipeline) {
+              session.pipeline.setPlaying(false);
+            }
+          }, 2000);
+        } catch (e) {
+          debug(`Error sending EOS: ${e}`);
+        }
       }
 
       session.config = null;
@@ -363,30 +271,28 @@ wss.on("listening", () => {
   const gpu = checkAMDGPU();
   if (gpu.available) {
     log(`✓ AMD GPU detected: ${gpu.device}`);
-    log(`✓ Hardware encoding available: h264_vaapi`);
+    log(`✓ Hardware encoding available: vah264enc`);
   } else {
-    log(`⚠ No AMD GPU detected, will use CPU encoding (libx264)`);
+    log(`⚠ No AMD GPU detected, will use CPU encoding (x264enc)`);
   }
 });
 
 wss.on("connection", (ws, req) => {
   const sessionId = Math.random().toString(36).slice(2, 10);
-  const fifoPath = join(tmpdir(), `stream-${sessionId}.webm`);
 
   const session: StreamSession = {
     ws,
-    ffmpeg: null,
+    pipeline: null,
+    appsrc: null,
     config: null,
     startTime: 0,
     hasReceivedData: false,
-    lastFFmpegLog: 0,
-    restartCount: 0,
+    lastLog: 0,
     rtmpConnected: false,
     rtmpConnectTime: null,
     totalBytesReceived: 0,
     framesReceived: 0,
-    fifoPath,
-    fifoFd: null,
+    useGpu: false,
   };
 
   sessions.set(sessionId, session);
@@ -409,30 +315,30 @@ wss.on("connection", (ws, req) => {
           return;
         }
 
-        if (session.fifoFd === null) {
-          error(`Cannot write data: file not open`);
+        if (!session.pipeline) {
+          if (!startGStreamer(session)) {
+            return;
+          }
+        }
+
+        if (!session.appsrc) {
+          error(`Cannot write data: appsrc not available`);
           return;
         }
 
         try {
-          writeSync(session.fifoFd, data);
+          const buffer = Buffer.from(data);
+          const gstBuffer = gstreamer.Buffer.fromData(buffer);
+          session.appsrc.emit("push-buffer", gstBuffer);
           session.totalBytesReceived += data.length;
           session.framesReceived++;
 
           if (!session.hasReceivedData) {
             log(`✓ First WebM chunk received for ${sessionId}, size: ${data.length} bytes`);
             session.hasReceivedData = true;
-            
-            if (!session.ffmpeg) {
-              session.ffmpeg = startFFmpeg(session);
-              if (!session.ffmpeg) {
-                ws.send(JSON.stringify({ type: "error", data: "Failed to start FFmpeg" }));
-                return;
-              }
-            }
           }
         } catch (e) {
-          error(`Failed to write WebM data: ${e}`);
+          error(`Failed to push buffer to GStreamer: ${e}`);
         }
       }
     } catch (e) {
@@ -443,17 +349,17 @@ wss.on("connection", (ws, req) => {
   ws.on("close", () => {
     log(`Client disconnected: ${sessionId}`);
 
-    if (session.fifoFd !== null) {
-      try { closeSync(session.fifoFd); } catch {}
-      session.fifoFd = null;
-    }
-
-    if (session.ffmpeg && !session.ffmpeg.killed) {
-      setTimeout(() => {
-        if (session.ffmpeg && !session.ffmpeg.killed) {
-          session.ffmpeg.kill("SIGTERM");
-        }
-      }, 1000);
+    if (session.pipeline) {
+      try {
+        session.pipeline.sendEos();
+        setTimeout(() => {
+          if (session.pipeline) {
+            session.pipeline.setPlaying(false);
+          }
+        }, 1000);
+      } catch (e) {
+        debug(`Error on close: ${e}`);
+      }
     }
 
     sessions.delete(sessionId);
@@ -471,8 +377,12 @@ wss.on("connection", (ws, req) => {
 process.on("SIGINT", () => {
   log("Shutting down...");
   for (const [, session] of sessions) {
-    if (session.ffmpeg && !session.ffmpeg.killed) {
-      session.ffmpeg.kill("SIGTERM");
+    if (session.pipeline) {
+      try {
+        session.pipeline.setPlaying(false);
+      } catch (e) {
+        debug(`Error stopping pipeline: ${e}`);
+      }
     }
   }
   wss.close();
