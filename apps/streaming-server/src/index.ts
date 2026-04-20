@@ -92,30 +92,31 @@ function checkAMDGPU(driverPreference: "mesa" | "vulkan" | "auto" = "auto"): { a
 }
 
 function buildGstPipeline(config: StreamConfig, useGpu: boolean): string {
-  const gopSize = config.fps * 2;
   const bitrateK = Math.round(config.bitrate / 1000);
 
   log(`GStreamer config: ${config.width}x${config.height} @ ${config.fps}fps, ${bitrateK}k bitrate, GPU: ${useGpu}`);
 
   const encoder = useGpu
-    ? `vah264enc bitrate=${bitrateK} target-usage=4 ! video/x-h264,profile=main,level=(string)4.0`
-    : `x264enc bitrate=${bitrateK} speed-preset=ultrafast tune=zerolatency ! video/x-h264,profile=main,level=(string)4.0`;
+    ? `vah264enc bitrate=${bitrateK} target-usage=4`
+    : `x264enc bitrate=${bitrateK} speed-preset=ultrafast tune=zerolatency`;
 
   const rtmpUrl = buildRtmpUrl(config.ingestUrl, config.streamKey);
 
-  let pipeline = `appsrc name=src format=time is-live=true block=false ! ` +
-    `matroskademux name=demux ` +
-    `demux. ! queue ! vp8dec ! videoconvert ! video/x-raw,format=NV12 ! ${encoder} ! ` +
-    `h264parse ! ` +
-    `flvmux name=mux streamable=true ! ` +
-    `queue ! ` +
-    `rtmpsink location="${rtmpUrl}"`;
+  let pipeline;
 
   if (config.hasAudio) {
-    pipeline = pipeline.replace(
-      `flvmux name=mux streamable=true`,
-      `demux. ! queue ! opusdec ! audioconvert ! audioresample ! audio/x-raw,format=S16LE,rate=48000,channels=2 ! voaacenc bitrate=128000 ! aacparse ! flvmux name=mux streamable=true`
-    );
+    pipeline = `appsrc name=src format=time is-live=true block=false ! ` +
+      `matroskademux name=demux ` +
+      `demux. ! queue ! vp8dec ! videoconvert ! video/x-raw,format=NV12 ! ${encoder} ! ` +
+      `h264parse ! flvmux name=mux streamable=true ` +
+      `demux. ! queue ! opusdec ! audioconvert ! audioresample ! audio/x-raw,format=F32LE,rate=48000,channels=2 ! avenc_aac bitrate=128000 ! aacparse ! mux. ` +
+      `mux. ! queue ! rtmpsink location="${rtmpUrl}"`;
+  } else {
+    pipeline = `appsrc name=src format=time is-live=true block=false ! ` +
+      `matroskademux name=demux ` +
+      `demux. ! queue ! vp8dec ! videoconvert ! video/x-raw,format=NV12 ! ${encoder} ! ` +
+      `h264parse ! flvmux name=mux streamable=true ! ` +
+      `queue ! rtmpsink location="${rtmpUrl}"`;
   }
 
   return pipeline;
@@ -158,7 +159,7 @@ function startGStreamer(session: StreamSession): boolean {
       return false;
     }
 
-    session.appsrc.set("caps", `video/x-vp8,width=${config.width},height=${config.height},framerate=${config.fps}/1`);
+    session.appsrc.set_caps(`video/x-vp8,width=${config.width},height=${config.height},framerate=${config.fps}/1`);
 
     session.pipeline.on("error", (err: Error) => {
       error("GStreamer pipeline error:", err);
